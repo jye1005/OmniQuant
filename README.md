@@ -22,8 +22,9 @@ OmniQuant is a simple and powerful quantization technique for LLMs. The current 
 
 
 ## News
-- [2025/05] 🔥 **We explore the [Scaling Law for Quantization-Aware Training](https://export.arxiv.org/abs/2505.14302), which offers insights and instruction for LLMs QAT.**
-- [2024/10] 🔥 We release a new weight-activation quantization algorithm, [PrefixQuant](https://github.com/ChenMnZ/PrefixQuant), which is the first work to let the performance of static activation quantization surpasses dynamic ones.
+- [2025/11] 🔥 **We open-source [INT vs. FP](https://github.com/ChenMnZ/INT_vs_FP), a framework to compare low-bit integer and float-point formats, including MXFP8/MXFP6/MXFP4/NVFP4 and MXINT8/MXINT6/MXINT4/NVINT4.**
+- [2025/05] 🔥 We explore the [Scaling Law for Quantization-Aware Training](https://export.arxiv.org/abs/2505.14302), which offers insights and instruction for LLMs QAT.
+- [2024/10] 🔥 We release a new weight-activation quantization algorithm, [PrefixQuant](https://github.com/ChenMnZ/PrefixQuant), which proposed an efficient method to isolate sink token (token-wise outlier).
 - [2024/7] 🔥 We release a new quantization algorithm, [EfficientQAT](https://github.com/OpenGVLab/EfficientQAT), which realizes quantization-aware training in a time-efficient and memory-efficient manner. Additionally, EfficientQAT is the current SoTA of uniform quantization.
 - [2024/1] 🌟 Our OmniQuant paper has been accepted for a Spotlight presentation at ICLR 2024 (only top 5% out of over 7200 submissions)! 🎉 Cheers!
 - [2023/12] 🔥 We provide support for Mixtral-8x7B. OmniQuant is capable of achieving near-lossless 4-bit quantization with Mixtral-8x7B-v0.1, which reduces the memory requirement from 87GB to 23GB.
