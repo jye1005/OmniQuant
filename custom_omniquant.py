@@ -48,6 +48,9 @@ class SpQRWandaConfig:
     gptq_block_size: int = 128  # GPTQ group_size (SpQR 16보다 큼)
     gptq_dampening_frac: float = 0.01
 
+    # ----- LWC 메모리 (penalty-only) -----
+    lwc_chunk_size: int = 10  # GPU에서 N개씩 처리. 0=전부 CPU, 1=레이어별 GPU, 10=10개씩 GPU
+
     # ----- wandb -----
     wandb_enable: bool = False
     wandb_project: str = "omniquant-spqr"
@@ -281,10 +284,11 @@ def run_3tier_omniquant(
     device = next(model.parameters()).device
     model.train()
 
-    # penalty-only 시 GPU OOM 방지: LWC를 CPU에서 실행
-    lwc_on_cpu = not cfg.use_reconstruction_loss
+    # penalty-only: chunk_size에 따라 GPU/CPU 분배. 0=전부 CPU, 1+=N개씩 GPU
+    lwc_on_cpu = not cfg.use_reconstruction_loss and cfg.lwc_chunk_size == 0
 
     lwc_modules = {}
+    lwc_names = []
     for name, module in model.named_modules():
         if name not in masks or name not in wanda_scores:
             continue
@@ -298,12 +302,16 @@ def run_3tier_omniquant(
             )
             lwc = lwc.to("cpu") if lwc_on_cpu else lwc.to(module.weight.device)
             lwc_modules[name] = lwc
+            lwc_names.append(name)
 
     if not lwc_modules:
         return model
 
+    chunk_size = cfg.lwc_chunk_size if not cfg.use_reconstruction_loss else 0
     if lwc_on_cpu:
-        print("[INFO] OmniQuant CPU 모드: LWC 최적화를 CPU에서 수행 (GPU OOM 방지)")
+        print("[INFO] OmniQuant CPU 모드: LWC 최적화를 CPU에서 수행")
+    elif chunk_size > 0:
+        print(f"[INFO] OmniQuant GPU 청크 모드: {chunk_size}개 레이어씩 GPU에서 처리")
 
     n_batches = len(calib_dataloader)
     print(f"[INFO] OmniQuant: LWC 적용 레이어 {len(lwc_modules)}개, epochs={n_epochs}, batches/epoch={n_batches}")
@@ -380,30 +388,58 @@ def run_3tier_omniquant(
                 _mse_val = mse_loss.item()
                 _wanda_val = wanda_penalty.item()
             else:
-                # 레이어별 순차 처리 (LWC on CPU: GPU 메모리 0 사용)
                 total_loss_val = 0.0
-                for name, module in model.named_modules():
-                    if name not in lwc_modules:
-                        continue
-                    optimizer.zero_grad()
-                    orig_w = module.weight.data.cpu().float()
-                    quant_w = lwc_modules[name](orig_w)
-                    layer_mask = masks[name]
-                    layer_wanda = wanda_scores[name].float()
+                if chunk_size > 0:
+                    # GPU 청크: N개씩 묶어서 backward
+                    for chunk_start in range(0, len(lwc_names), chunk_size):
+                        chunk_names = lwc_names[chunk_start : chunk_start + chunk_size]
+                        optimizer.zero_grad()
+                        chunk_loss = torch.tensor(0.0, device=device)
+                        for name in chunk_names:
+                            module = dict(model.named_modules())[name]
+                            mod_device = module.weight.device
+                            orig_w = module.weight.data
+                            quant_w = lwc_modules[name](orig_w)
+                            layer_mask = masks[name]
+                            layer_wanda = wanda_scores[name].to(mod_device)
 
-                    clipping_error = torch.abs(orig_w - quant_w)
-                    mask_vip = layer_mask["vip"]
-                    mask_gems = layer_mask["gems"]
+                            clipping_error = torch.abs(orig_w - quant_w)
+                            mask_vip = layer_mask["vip"].to(mod_device)
+                            mask_gems = layer_mask["gems"].to(mod_device)
 
-                    vip_penalty = torch.sum(clipping_error[mask_vip] * cfg.vip_penalty_weight)
-                    gems_penalty = torch.sum(layer_wanda[mask_gems] * clipping_error[mask_gems])
-                    layer_loss = vip_penalty + cfg.gems_penalty_weight * gems_penalty
-                    total_loss_val += layer_loss.item()
+                            vip_penalty = torch.sum(clipping_error[mask_vip] * cfg.vip_penalty_weight).to(device)
+                            gems_penalty = torch.sum(
+                                layer_wanda[mask_gems] * clipping_error[mask_gems]
+                            ).to(device)
+                            chunk_loss = chunk_loss + vip_penalty + cfg.gems_penalty_weight * gems_penalty
 
-                    layer_loss.backward()
-                    optimizer.step()
-                    del orig_w, quant_w, clipping_error, layer_loss, vip_penalty, gems_penalty
-                    gc.collect()
+                        total_loss_val += chunk_loss.item()
+                        chunk_loss.backward()
+                        optimizer.step()
+                        del chunk_loss
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                else:
+                    # CPU: 레이어별 순차
+                    for name in lwc_names:
+                        optimizer.zero_grad()
+                        orig_w = dict(model.named_modules())[name].weight.data.cpu().float()
+                        quant_w = lwc_modules[name](orig_w)
+                        layer_mask = masks[name]
+                        layer_wanda = wanda_scores[name].float()
+
+                        clipping_error = torch.abs(orig_w - quant_w)
+                        vip_penalty = torch.sum(clipping_error[layer_mask["vip"]] * cfg.vip_penalty_weight)
+                        gems_penalty = torch.sum(
+                            layer_wanda[layer_mask["gems"]] * clipping_error[layer_mask["gems"]]
+                        )
+                        layer_loss = vip_penalty + cfg.gems_penalty_weight * gems_penalty
+                        total_loss_val += layer_loss.item()
+
+                        layer_loss.backward()
+                        optimizer.step()
+                        del orig_w, quant_w, clipping_error, layer_loss, vip_penalty, gems_penalty
+                        gc.collect()
 
                 _mse_val, _wanda_val = None, None
 
@@ -439,12 +475,13 @@ def run_3tier_omniquant(
         for name, module in model.named_modules():
             if name in lwc_modules:
                 w = module.weight.data
-                if lwc_on_cpu:
+                lwc = lwc_modules[name]
+                if next(lwc.parameters()).device.type == "cpu":
                     w_cpu = w.cpu()
-                    result = lwc_modules[name](w_cpu)
+                    result = lwc(w_cpu)
                     module.weight.data = result.to(w.device, dtype=w.dtype)
                 else:
-                    module.weight.data = lwc_modules[name](w)
+                    module.weight.data = lwc(w)
 
     if epoch_losses:
         print(f"[INFO] OmniQuant 최종: loss {epoch_losses[0]:.6f} → {epoch_losses[-1]:.6f}")
