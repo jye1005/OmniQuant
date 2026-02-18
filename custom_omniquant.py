@@ -377,12 +377,13 @@ def run_3tier_omniquant(
                 for name, module in model.named_modules():
                     if name in lwc_modules:
                         mod_device = module.weight.device
-                        weight = original_weights[name]
-                        quantized_weight = module.weight.data.clone()
+                        orig_w = original_weights[name]
+                        # LWC 출력을 직접 사용 (grad_fn 유지, backward 가능)
+                        quant_w = lwc_modules[name](orig_w)
                         layer_mask = masks[name]
                         layer_wanda = wanda_scores[name].to(mod_device)
 
-                        clipping_error = torch.abs(weight - quantized_weight)
+                        clipping_error = torch.abs(orig_w - quant_w)
                         mask_vip = layer_mask["vip"].to(mod_device)
                         mask_gems = layer_mask["gems"].to(mod_device)
 
@@ -392,14 +393,17 @@ def run_3tier_omniquant(
                         ).to(device)
                         total_loss = total_loss + vip_penalty + cfg.gems_penalty_weight * gems_penalty
 
-                        module.weight.data = original_weights[name]
+                # penalty-only 모드: 가중치 원상복구 (다음 배치용)
+                for name in lwc_modules:
+                    dict(model.named_modules())[name].weight.data = original_weights[name]
 
                 _mse_val, _wanda_val = None, None
 
             total_loss.backward()
             optimizer.step()
 
-            epoch_loss_sum += total_loss.item()
+            loss_val = total_loss.item()
+            epoch_loss_sum += loss_val
             del total_loss
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -409,7 +413,7 @@ def run_3tier_omniquant(
             if _wandb_run is not None:
                 log_interval = cfg.wandb_log_interval if cfg.wandb_log_interval > 0 else 1
                 if global_step % log_interval == 0:
-                    log_dict = {"train/loss": total_loss.item(), "train/epoch": epoch}
+                    log_dict = {"train/loss": loss_val, "train/epoch": epoch}
                     if cfg.use_reconstruction_loss and _mse_val is not None:
                         log_dict["train/mse_loss"] = _mse_val
                         log_dict["train/wanda_penalty"] = _wanda_val
