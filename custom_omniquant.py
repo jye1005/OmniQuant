@@ -147,13 +147,16 @@ def calculate_hessian_wanda(
         wanda_score = wanda_score.to(W.device)
 
         tau_h_val = torch.quantile(hessian_score, tau_h)
-        survivors = wanda_score[hessian_score > tau_h_val]
+        # hessian_score [1, in], wanda_score [out, in] → 마스크를 [out, in]으로 브로드캐스트
+        mask_survivors = (hessian_score > tau_h_val).expand_as(wanda_score)
+        survivors = wanda_score[mask_survivors]
         tau_w_val = torch.quantile(survivors, tau_w) if len(survivors) > 0 else 0
 
+        mask_trash = (hessian_score <= tau_h_val).expand_as(wanda_score)
         layer_masks = {
-            "trash": (hessian_score <= tau_h_val).cpu(),
-            "gems": ((hessian_score > tau_h_val) & (wanda_score <= tau_w_val)).cpu(),
-            "vip": ((hessian_score > tau_h_val) & (wanda_score > tau_w_val)).cpu(),
+            "trash": mask_trash.cpu(),
+            "gems": (mask_survivors & (wanda_score <= tau_w_val)).cpu(),
+            "vip": (mask_survivors & (wanda_score > tau_w_val)).cpu(),
         }
 
         masks[name] = layer_masks
