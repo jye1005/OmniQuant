@@ -6,6 +6,7 @@ import os
 import json
 from dataclasses import dataclass
 from typing import Optional
+import gc
 
 try:
     import wandb
@@ -81,19 +82,33 @@ def calculate_hessian_wanda(
     x_means = {}
     device = next(model.parameters()).device
 
-    # 활성화값(X)을 가로채기 위한 Hook 함수 설정
-    activation_cache = {}
+    # 온라인 누적 (OOM 방지: 리스트 대신 합계만 유지)
+    hessian_diag_sum = {}
+    x_sum_dict = {}
+    x_count_dict = {}
+
     def hook_fn(name):
         def forward_hook(module, input, output):
             x = input[0].detach()
             if x.dim() == 3:
                 x = x.view(-1, x.shape[-1])
-            if name not in activation_cache:
-                activation_cache[name] = []
-            activation_cache[name].append(x.cpu())
+            x = x.float()  # CPU 연산용
+
+            x_sq_sum = (x ** 2).sum(dim=0).cpu()
+            x_row_sum = x.sum(dim=0).cpu()
+            n_rows = x.shape[0]
+
+            if name not in hessian_diag_sum:
+                hessian_diag_sum[name] = torch.zeros_like(x_sq_sum)
+                x_sum_dict[name] = torch.zeros_like(x_row_sum)
+                x_count_dict[name] = 0
+
+            hessian_diag_sum[name] += x_sq_sum
+            x_sum_dict[name] += x_row_sum
+            x_count_dict[name] += n_rows
         return forward_hook
 
-    # Hook 등록 (EXAONE의 Linear 레이어 타겟)
+    # Hook 등록
     linear_names = []
     hooks = []
     for name, module in model.named_modules():
@@ -102,56 +117,55 @@ def calculate_hessian_wanda(
             hooks.append(module.register_forward_hook(hook_fn(name)))
     print(f"[INFO] Hessian/Wanda 대상 레이어: {len(linear_names)}개")
 
-    # 캘리브레이션 데이터 통과 (Activation 수집)
+    # 캘리브레이션 데이터 통과 (즉시 누적, 원본 비축적)
     model.eval()
     with torch.no_grad():
-        for batch in tqdm(calib_dataloader, desc="데이터 통과 및 Activation 수집"):
+        for batch in tqdm(calib_dataloader, desc="데이터 통과 및 지표 누적"):
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch.get("attention_mask")
             if attention_mask is not None:
                 attention_mask = attention_mask.to(device)
             model(input_ids=input_ids, attention_mask=attention_mask)
+            torch.cuda.empty_cache()
 
     # Hook 제거
     for h in hooks:
         h.remove()
 
-    # 수집된 데이터를 바탕으로 스코어 및 마스크 계산
+    # 누적 합계로 최종 스코어 계산
     for name in linear_names:
-        if name not in activation_cache:
+        if name not in hessian_diag_sum:
             continue
         module = dict(model.named_modules())[name]
         W = module.weight.data.clone()
-        X_list = activation_cache[name]
-        X_cat = torch.cat(X_list, dim=0)  # [total_seq_len, hidden_dim]
 
-        # Wanda 스코어: |W| * ||X||_2
-        x_norm = torch.norm(X_cat, p=2, dim=0)
-        wanda_score = torch.abs(W) * x_norm.unsqueeze(0)
+        hessian_diag = hessian_diag_sum[name]
+        x_norm = torch.sqrt(hessian_diag + 1e-8)
+        wanda_score = (torch.abs(W).cpu() * x_norm.unsqueeze(0)).to(W.device)
 
-        # Hessian 스코어 (대각 성분 근사): X^T * X 의 대각 성분
-        hessian_diag = torch.sum(X_cat ** 2, dim=0)
-        hessian_score = 1.0 / (hessian_diag + 1e-8).unsqueeze(0)
+        hessian_score = (1.0 / (hessian_diag + 1e-8)).unsqueeze(0).to(W.device)
+        wanda_score = wanda_score.to(W.device)
 
-        # 임계값 계산 (SpQR: Hessian→Trash, Wanda→Gems/VIP)
         tau_h_val = torch.quantile(hessian_score, tau_h)
         survivors = wanda_score[hessian_score > tau_h_val]
         tau_w_val = torch.quantile(survivors, tau_w) if len(survivors) > 0 else 0
 
-        # 마스크 생성
         layer_masks = {
-            "trash": hessian_score <= tau_h_val,
-            "gems": (hessian_score > tau_h_val) & (wanda_score <= tau_w_val),
-            "vip": (hessian_score > tau_h_val) & (wanda_score > tau_w_val),
+            "trash": (hessian_score <= tau_h_val).cpu(),
+            "gems": ((hessian_score > tau_h_val) & (wanda_score <= tau_w_val)).cpu(),
+            "vip": ((hessian_score > tau_h_val) & (wanda_score > tau_w_val)).cpu(),
         }
 
         masks[name] = layer_masks
-        wanda_scores[name] = wanda_score
+        wanda_scores[name] = wanda_score.cpu()
 
-        # Bias Correction용: 입력 활성화 평균 (SpQR)
-        x_means[name] = X_cat.mean(dim=0)
+        count = max(x_count_dict[name], 1)
+        x_means[name] = (x_sum_dict[name] / count).to(W.dtype)
 
-        del activation_cache[name]
+    del hessian_diag_sum, x_sum_dict, x_count_dict
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # 마스크 통계 로깅
     total = sum(m["trash"].numel() + m["gems"].numel() + m["vip"].numel() for m in masks.values())
@@ -383,6 +397,9 @@ def run_3tier_omniquant(
             optimizer.step()
 
             epoch_loss_sum += total_loss.item()
+            del total_loss
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             epoch_batches += 1
 
             # wandb 로깅

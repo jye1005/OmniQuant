@@ -1,4 +1,5 @@
 import os
+import gc
 import time
 import torch
 import shutil
@@ -18,42 +19,47 @@ from custom_omniquant import (
 from llmcompressor.modifiers.quantization import GPTQModifier
 from llmcompressor import oneshot
 
-MODEL_ID = "LGAI-EXAONE/EXAONE-4.0-1.2B" # 반드시 순정 모델 사용!
+MODEL_ID = "LGAI-EXAONE/EXAONE-4.0-1.2B"
 OUT_DIR = "./model"
 DATASET_ID = "LGAI-EXAONE/MANTA-1M"
 DATASET_SPLIT = "train"
-NUM_CALIBRATION_SAMPLES = 256
-MAX_SEQUENCE_LENGTH = 512
 
-# ========== SpQR + Wanda + OmniQuant 하이퍼파라미터 (여기서 지정) ==========
+# ★ Slurm/제한 메모리 환경: True로 설정 (OOM 방지)
+# 참고: "oom-kill"은 관리자가 끊은 게 아니라, 메모리 초과 시 시스템이 자동 종료한 것임
+LOW_MEMORY_MODE = True
+
+NUM_CALIBRATION_SAMPLES = 32 if LOW_MEMORY_MODE else 256
+MAX_SEQUENCE_LENGTH = 128 if LOW_MEMORY_MODE else 512
+CALIB_BATCH_SIZE = 1 if LOW_MEMORY_MODE else 4
+
+# ========== SpQR + Wanda + OmniQuant 하이퍼파라미터 ==========
 SPQR_CONFIG = SpQRWandaConfig(
-    # [1단계] Hessian Trash (Pruning)
-    tau_h_percentile=0.30,       # 하위 30% → Trash (0-bit)
-    # [2단계] Wanda Gems vs VIP
-    tau_w_percentile=0.50,       # 상위 50% → VIP
+    tau_h_percentile=0.30,
+    tau_w_percentile=0.50,
     spqr_blocksize=16,
     spqr_outlier_percentile=None,
     n_bits_gems=4,
     n_bits_vip=16,
-    bias_correction=True,  # SpQR Bias Correction (Pruning 출력 보정)
-    # OmniQuant LWC
-    omniquant_epochs=20,
+    bias_correction=True,
+    omniquant_epochs=10 if LOW_MEMORY_MODE else 20,
     omniquant_lr=1e-2,
     vip_penalty_weight=100.0,
     gems_penalty_weight=0.01,
-    use_reconstruction_loss=True,  # MSE(original_out, quant_out) + wanda_penalty
+    use_reconstruction_loss=not LOW_MEMORY_MODE,  # False 시 메모리 절약 (2배 forward 생략)
     lambda_w=0.01,
     # GPTQ 포장
     gptq_block_size=128,
     gptq_dampening_frac=0.01,
-    # wandb (실험 추적)
-    wandb_enable=True,  # True로 설정 시 wandb 로깅
+    # wandb (LOW_MEMORY 시 자동 비활성화)
+    wandb_enable=not LOW_MEMORY_MODE,
     wandb_project="omniquant-spqr",
     wandb_run_name=None,  # None이면 자동, 또는 "exaone-1.2b-exp1" 등 지정
     wandb_log_interval=10,  # 10 batch마다 로깅
 )
 
 _t_start = time.time()
+if LOW_MEMORY_MODE:
+    print("[INFO] LOW_MEMORY_MODE: samples=64, max_len=256, batch=1, reconstruction_loss=OFF")
 print(f"[INFO] === SpQR+Wanda+OmniQuant 파이프라인 (tau_h={SPQR_CONFIG.tau_h_percentile}, tau_w={SPQR_CONFIG.tau_w_percentile}) ===")
 print("[INFO] 순정 모델 로드 중...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
@@ -98,11 +104,12 @@ def collate_fn(batch):
 
 calib_dataloader = DataLoader(
     tokenized_ds,
-    batch_size=4,
+    batch_size=CALIB_BATCH_SIZE,
     shuffle=False,
     collate_fn=collate_fn,
 )
-print(f"[INFO] 캘리브레이션: {len(tokenized_ds)} 샘플, batch_size=4, max_len={MAX_SEQUENCE_LENGTH}")
+print(f"[INFO] 캘리브레이션: {len(tokenized_ds)} 샘플, batch_size={CALIB_BATCH_SIZE}, max_len={MAX_SEQUENCE_LENGTH}" + 
+      (" [LOW_MEMORY]" if LOW_MEMORY_MODE else ""))
 
 # =====================================================================
 # ★ 지혜 님만의 독창적인 압축 최적화 구간 (Phase 1)
