@@ -281,22 +281,29 @@ def run_3tier_omniquant(
     device = next(model.parameters()).device
     model.train()
 
+    # penalty-only 시 GPU OOM 방지: LWC를 CPU에서 실행
+    lwc_on_cpu = not cfg.use_reconstruction_loss
+
     lwc_modules = {}
     for name, module in model.named_modules():
         if name not in masks or name not in wanda_scores:
             continue
         if isinstance(module, nn.Linear) and "lm_head" not in name:
             lwc = SensitivityAwareLWC(
-                module.weight.data,
+                module.weight.data.cpu() if lwc_on_cpu else module.weight.data,
                 wanda_scores[name],
                 masks[name],
                 n_bits=cfg.n_bits_gems,
-                device=module.weight.device,
-            ).to(module.weight.device)
+                device=torch.device("cpu") if lwc_on_cpu else module.weight.device,
+            )
+            lwc = lwc.to("cpu") if lwc_on_cpu else lwc.to(module.weight.device)
             lwc_modules[name] = lwc
 
     if not lwc_modules:
         return model
+
+    if lwc_on_cpu:
+        print("[INFO] OmniQuant CPU 모드: LWC 최적화를 CPU에서 수행 (GPU OOM 방지)")
 
     n_batches = len(calib_dataloader)
     print(f"[INFO] OmniQuant: LWC 적용 레이어 {len(lwc_modules)}개, epochs={n_epochs}, batches/epoch={n_batches}")
@@ -336,19 +343,18 @@ def run_3tier_omniquant(
         for batch_idx, batch in enumerate(tqdm(calib_dataloader, desc=f"OmniQuant Epoch {epoch+1}/{n_epochs}")):
             optimizer.zero_grad()
 
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch.get("attention_mask")
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(device)
-
             original_weights = {}
-            for name, module in model.named_modules():
-                if name in lwc_modules:
-                    original_weights[name] = module.weight.data.clone()
-                    if cfg.use_reconstruction_loss:
+            if cfg.use_reconstruction_loss:
+                for name, module in model.named_modules():
+                    if name in lwc_modules:
+                        original_weights[name] = module.weight.data.clone()
                         module.weight.data = lwc_modules[name](original_weights[name])
 
             if cfg.use_reconstruction_loss:
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch.get("attention_mask")
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(device)
                 quant_out = model(input_ids=input_ids, attention_mask=attention_mask).logits
 
                 for name in lwc_modules:
@@ -374,34 +380,30 @@ def run_3tier_omniquant(
                 _mse_val = mse_loss.item()
                 _wanda_val = wanda_penalty.item()
             else:
-                # 레이어별 순차 처리 (GPU OOM 방지: 한 번에 1개 레이어만 graph에)
+                # 레이어별 순차 처리 (LWC on CPU: GPU 메모리 0 사용)
                 total_loss_val = 0.0
                 for name, module in model.named_modules():
                     if name not in lwc_modules:
                         continue
                     optimizer.zero_grad()
-                    mod_device = module.weight.device
-                    orig_w = original_weights[name]
+                    orig_w = module.weight.data.cpu().float()
                     quant_w = lwc_modules[name](orig_w)
                     layer_mask = masks[name]
-                    layer_wanda = wanda_scores[name].to(mod_device)
+                    layer_wanda = wanda_scores[name].float()
 
                     clipping_error = torch.abs(orig_w - quant_w)
-                    mask_vip = layer_mask["vip"].to(mod_device)
-                    mask_gems = layer_mask["gems"].to(mod_device)
+                    mask_vip = layer_mask["vip"]
+                    mask_gems = layer_mask["gems"]
 
-                    vip_penalty = torch.sum(clipping_error[mask_vip] * cfg.vip_penalty_weight).to(device)
-                    gems_penalty = torch.sum(
-                        layer_wanda[mask_gems] * clipping_error[mask_gems]
-                    ).to(device)
+                    vip_penalty = torch.sum(clipping_error[mask_vip] * cfg.vip_penalty_weight)
+                    gems_penalty = torch.sum(layer_wanda[mask_gems] * clipping_error[mask_gems])
                     layer_loss = vip_penalty + cfg.gems_penalty_weight * gems_penalty
                     total_loss_val += layer_loss.item()
 
                     layer_loss.backward()
                     optimizer.step()
-                    del quant_w, clipping_error, layer_loss, vip_penalty, gems_penalty
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    del orig_w, quant_w, clipping_error, layer_loss, vip_penalty, gems_penalty
+                    gc.collect()
 
                 _mse_val, _wanda_val = None, None
 
@@ -436,7 +438,13 @@ def run_3tier_omniquant(
     with torch.no_grad():
         for name, module in model.named_modules():
             if name in lwc_modules:
-                module.weight.data = lwc_modules[name](module.weight.data)
+                w = module.weight.data
+                if lwc_on_cpu:
+                    w_cpu = w.cpu()
+                    result = lwc_modules[name](w_cpu)
+                    module.weight.data = result.to(w.device, dtype=w.dtype)
+                else:
+                    module.weight.data = lwc_modules[name](w)
 
     if epoch_losses:
         print(f"[INFO] OmniQuant 최종: loss {epoch_losses[0]:.6f} → {epoch_losses[-1]:.6f}")
