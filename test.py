@@ -1,6 +1,7 @@
 import os
 import torch
 import shutil
+from torch.utils.data import DataLoader
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -20,16 +21,49 @@ MAX_SEQUENCE_LENGTH = 512
 
 print("[INFO] 순정 모델 로드 중...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16, device_map="auto")
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    trust_remote_code=True,
+)
 
 print("[INFO] 캘리브레이션 데이터 준비 중...")
 ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
+
+
 def preprocess(example):
     return {"text": tokenizer.apply_chat_template(example["conversations"], add_generation_prompt=True, tokenize=False)}
-ds = ds.map(preprocess)
 
-# (주의: custom_omniquant.py에서 사용할 수 있도록 ds를 DataLoader 형태로 변환하는 코드가 필요합니다)
-calib_dataloader = ds # 임시 표현
+
+ds = ds.map(preprocess, remove_columns=["conversations"] if "conversations" in ds.column_names else ds.column_names)
+
+
+def tokenize_fn(examples):
+    return tokenizer(
+        examples["text"],
+        truncation=True,
+        max_length=MAX_SEQUENCE_LENGTH,
+        padding="max_length",
+    )
+
+
+tokenized_ds = ds.map(tokenize_fn, batched=True, remove_columns=["text"])
+
+
+def collate_fn(batch):
+    return {
+        "input_ids": torch.stack([torch.tensor(b["input_ids"]) for b in batch]),
+        "attention_mask": torch.stack([torch.tensor(b["attention_mask"]) for b in batch]),
+    }
+
+
+calib_dataloader = DataLoader(
+    tokenized_ds,
+    batch_size=4,
+    shuffle=False,
+    collate_fn=collate_fn,
+)
 
 # =====================================================================
 # ★ 지혜 님만의 독창적인 압축 최적화 구간 (Phase 1)
