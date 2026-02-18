@@ -345,7 +345,8 @@ def run_3tier_omniquant(
             for name, module in model.named_modules():
                 if name in lwc_modules:
                     original_weights[name] = module.weight.data.clone()
-                    module.weight.data = lwc_modules[name](original_weights[name])
+                    if cfg.use_reconstruction_loss:
+                        module.weight.data = lwc_modules[name](original_weights[name])
 
             if cfg.use_reconstruction_loss:
                 quant_out = model(input_ids=input_ids, attention_mask=attention_mask).logits
@@ -373,38 +374,46 @@ def run_3tier_omniquant(
                 _mse_val = mse_loss.item()
                 _wanda_val = wanda_penalty.item()
             else:
-                total_loss = torch.tensor(0.0, device=device)
+                # 레이어별 순차 처리 (GPU OOM 방지: 한 번에 1개 레이어만 graph에)
+                total_loss_val = 0.0
                 for name, module in model.named_modules():
-                    if name in lwc_modules:
-                        mod_device = module.weight.device
-                        orig_w = original_weights[name]
-                        # LWC 출력을 직접 사용 (grad_fn 유지, backward 가능)
-                        quant_w = lwc_modules[name](orig_w)
-                        layer_mask = masks[name]
-                        layer_wanda = wanda_scores[name].to(mod_device)
+                    if name not in lwc_modules:
+                        continue
+                    optimizer.zero_grad()
+                    mod_device = module.weight.device
+                    orig_w = original_weights[name]
+                    quant_w = lwc_modules[name](orig_w)
+                    layer_mask = masks[name]
+                    layer_wanda = wanda_scores[name].to(mod_device)
 
-                        clipping_error = torch.abs(orig_w - quant_w)
-                        mask_vip = layer_mask["vip"].to(mod_device)
-                        mask_gems = layer_mask["gems"].to(mod_device)
+                    clipping_error = torch.abs(orig_w - quant_w)
+                    mask_vip = layer_mask["vip"].to(mod_device)
+                    mask_gems = layer_mask["gems"].to(mod_device)
 
-                        vip_penalty = torch.sum(clipping_error[mask_vip] * cfg.vip_penalty_weight).to(device)
-                        gems_penalty = torch.sum(
-                            layer_wanda[mask_gems] * clipping_error[mask_gems]
-                        ).to(device)
-                        total_loss = total_loss + vip_penalty + cfg.gems_penalty_weight * gems_penalty
+                    vip_penalty = torch.sum(clipping_error[mask_vip] * cfg.vip_penalty_weight).to(device)
+                    gems_penalty = torch.sum(
+                        layer_wanda[mask_gems] * clipping_error[mask_gems]
+                    ).to(device)
+                    layer_loss = vip_penalty + cfg.gems_penalty_weight * gems_penalty
+                    total_loss_val += layer_loss.item()
 
-                # penalty-only 모드: 가중치 원상복구 (다음 배치용)
-                for name in lwc_modules:
-                    dict(model.named_modules())[name].weight.data = original_weights[name]
+                    layer_loss.backward()
+                    optimizer.step()
+                    del quant_w, clipping_error, layer_loss, vip_penalty, gems_penalty
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
                 _mse_val, _wanda_val = None, None
 
-            total_loss.backward()
-            optimizer.step()
-
-            loss_val = total_loss.item()
+            if cfg.use_reconstruction_loss:
+                total_loss.backward()
+                optimizer.step()
+                loss_val = total_loss.item()
+            else:
+                loss_val = total_loss_val
             epoch_loss_sum += loss_val
-            del total_loss
+            if cfg.use_reconstruction_loss:
+                del total_loss
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             epoch_batches += 1
