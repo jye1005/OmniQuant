@@ -1,5 +1,6 @@
 import os
 import gc
+import json
 import time
 import argparse
 import torch
@@ -170,6 +171,7 @@ def main():
     # =====================================================================
     print("[INFO] 제출용 INT4 포장(Packing) 작업 시작...")
     _t3 = time.time()
+    os.makedirs(args.out_dir, exist_ok=True)
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -195,12 +197,27 @@ def main():
     print(f"[INFO] GPTQ 포장 완료 ({time.time()-_t3:.1f}s)")
 
     print("[INFO] 모델 저장 중...")
-    os.makedirs(args.out_dir, exist_ok=True)
-
     model.save_pretrained(args.out_dir, save_compressed=True)
     tokenizer.save_pretrained(args.out_dir)
+    n_files = len([f for f in os.scandir(args.out_dir) if f.is_file()])
     _out_size_mb = sum(f.stat().st_size for f in os.scandir(args.out_dir) if f.is_file()) / 1024 / 1024
-    print(f"[INFO] 모델 저장 완료: {args.out_dir} ({_out_size_mb:.1f} MB)")
+    _safetensors_mb = sum(
+        f.stat().st_size for f in os.scandir(args.out_dir)
+        if f.is_file() and f.name.endswith(".safetensors")
+    ) / 1024 / 1024
+    print(f"[INFO] 모델 저장 완료: {args.out_dir} ({n_files}개 파일, {_out_size_mb:.1f} MB)")
+    if n_files == 0:
+        raise RuntimeError(f"저장 실패: {args.out_dir}에 파일이 없습니다. oneshot/save_pretrained 확인 필요.")
+    if _safetensors_mb > 1500:
+        print(f"[WARN] ⚠️ .safetensors 합계 {_safetensors_mb:.0f}MB — INT4면 ~800MB여야 함. save_compressed 미적용 가능성 있음.")
+    config_path = os.path.join(args.out_dir, "config.json")
+    if os.path.isfile(config_path):
+        with open(config_path) as f:
+            cfg = json.load(f)
+        qc = cfg.get("quantization_config") or {}
+        qc_str = json.dumps(qc)
+        if "compressed-tensors" not in qc_str and "quant_method" not in qc_str:
+            print("[WARN] ⚠️ config.json에 quant_method/compressed-tensors 없음 — vLLM이 인식 못할 수 있음.")
 
     # =====================================================================
     # ★ 압축 및 제출 준비 (Phase 3)
@@ -208,7 +225,7 @@ def main():
     out_dir_abs = os.path.abspath(args.out_dir)
     zip_base = os.path.join(os.path.dirname(out_dir_abs), args.zip_name)
     zip_path = f"{zip_base}.zip"
-    print(f"[INFO] {args.zip_name}.zip 생성 중...")
+    print(f"[INFO] {args.zip_name}.zip 생성 중... (경로: {zip_path})")
     shutil.make_archive(base_name=zip_base, format="zip", root_dir=os.path.dirname(out_dir_abs), base_dir=os.path.basename(out_dir_abs))
     _zip_size_mb = os.path.getsize(zip_path) / 1024 / 1024
     print(f"[INFO] 생성 완료: {zip_path} ({_zip_size_mb:.1f} MB)")
