@@ -216,10 +216,10 @@ def main():
         )
     ]
 
-    # llmcompressor GPTQ는 bfloat16과 dtype 충돌 → float16으로 변환
+    # llmcompressor GPTQ는 bfloat16과 dtype 충돌 (BFloat16 vs Float) → float32로 변환
     if next(model.parameters()).dtype == torch.bfloat16:
-        print("[INFO] oneshot 호환을 위해 model bfloat16 → float16 변환")
-        model = model.to(torch.float16)
+        print("[INFO] oneshot 호환을 위해 model bfloat16 → float32 변환")
+        model = model.to(torch.float32)
 
     try:
         oneshot(
