@@ -2,6 +2,7 @@ import os
 import gc
 import json
 import time
+import uuid
 import argparse
 import torch
 import shutil
@@ -65,7 +66,7 @@ def parse_args():
     p.add_argument("--wandb_interval", type=int, default=10)
 
     # 출력
-    p.add_argument("--zip_name", default="baseline_submit")
+    p.add_argument("--zip_name", default=None, help="None이면 랜덤 이름 자동 생성 (덮어쓰기 방지)")
     return p.parse_args()
 
 
@@ -256,9 +257,10 @@ def main():
     # ★ 압축 및 제출 준비 (Phase 3)
     # =====================================================================
     out_dir_abs = os.path.abspath(args.out_dir)
-    zip_base = os.path.join(os.path.dirname(out_dir_abs), args.zip_name)
+    zip_name = args.zip_name or f"submit_{uuid.uuid4().hex[:12]}"
+    zip_base = os.path.join(os.path.dirname(out_dir_abs), zip_name)
     zip_path = f"{zip_base}.zip"
-    print(f"[INFO] {args.zip_name}.zip 생성 중... (경로: {zip_path})")
+    print(f"[INFO] {zip_name}.zip 생성 중... (경로: {zip_path})")
     shutil.make_archive(base_name=zip_base, format="zip", root_dir=os.path.dirname(out_dir_abs), base_dir=os.path.basename(out_dir_abs))
     _zip_size_mb = os.path.getsize(zip_path) / 1024 / 1024
     print(f"[INFO] 생성 완료: {zip_path} ({_zip_size_mb:.1f} MB)")
