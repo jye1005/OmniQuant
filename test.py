@@ -207,7 +207,7 @@ def main():
             scheme="W4A16",
             block_size=config.gptq_block_size,
             dampening_frac=config.gptq_dampening_frac,
-            actorder=False,
+            actorder="static",  # group|weight|dynamic|static (False → static으로 고정)
         )
     ]
 
