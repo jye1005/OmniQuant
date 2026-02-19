@@ -24,6 +24,10 @@ def parse_args():
     # 메모리 (24GB GPU OOM 시 --low_memory 사용)
     p.add_argument("--low_memory", action="store_true", help="OOM 방지: num_samples=32, max_len=128, lwc_chunk_size=0(CPU)")
     p.add_argument("--cuda_alloc_conf", type=str, default=None, help="예: expandable_segments:True (OOM 시 메모리 조각화 완화)")
+    # GPU 병렬
+    p.add_argument("--cuda_devices", type=str, default=None, help="사용할 GPU (예: 0,1,2). 미지정 시 전체 사용")
+    p.add_argument("--device_map", type=str, default="auto", help="auto|balanced|sequential|cuda:0 (멀티GPU 시 auto)")
+    p.add_argument("--max_memory", type=str, default=None, help="GPU별 메모리 한도 (예: 0:22GiB,1:22GiB)")
     # 데이터/모델
     p.add_argument("--model_id", default="LGAI-EXAONE/EXAONE-4.0-1.2B")
     p.add_argument("--out_dir", default="./model")
@@ -68,8 +72,14 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # out_dir를 절대경로로 고정 (실행 위치와 무관하게 동일한 경로에 저장)
+    args.out_dir = os.path.abspath(args.out_dir)
+
     if args.cuda_alloc_conf:
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", args.cuda_alloc_conf)
+    if args.cuda_devices:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
+        print(f"[INFO] GPU 지정: {args.cuda_devices}")
     if args.low_memory:
         args.num_samples = 32
         args.max_len = 128
@@ -97,18 +107,31 @@ def main():
 
     _t_start = time.time()
     print(f"[INFO] === SpQR+Wanda+OmniQuant (tau_h={config.tau_h_percentile}, tau_w={config.tau_w_percentile}) ===")
+    print(f"[INFO] 저장 경로(절대): {args.out_dir}")
     if args.wandb:
         print(f"[INFO] wandb: {args.wandb_project}")
     print("[INFO] 순정 모델 로드 중...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
+    load_kwargs = {
+        "torch_dtype": torch.bfloat16,
+        "device_map": args.device_map,
+        "trust_remote_code": True,
+    }
+    if args.max_memory and torch.cuda.is_available():
+        max_mem = {}
+        for item in args.max_memory.split(","):
+            dev, mem = item.strip().split(":")
+            max_mem[int(dev)] = mem.strip()
+        load_kwargs["max_memory"] = max_mem
+    model = AutoModelForCausalLM.from_pretrained(args.model_id, **load_kwargs)
     _n_params = sum(p.numel() for p in model.parameters())
-    print(f"[INFO] 모델 로드 완료: {_n_params/1e6:.2f}M params ({time.time()-_t_start:.1f}s)")
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    print(f"[INFO] 모델 로드 완료: {_n_params/1e6:.2f}M params ({time.time()-_t_start:.1f}s), GPU={n_gpus}개")
+    if hasattr(model, "hf_device_map") and model.hf_device_map:
+        dev_counts = {}
+        for v in model.hf_device_map.values():
+            dev_counts[str(v)] = dev_counts.get(str(v), 0) + 1
+        print(f"[INFO] device_map: {dev_counts}")
 
     print("[INFO] 캘리브레이션 데이터 준비 중...")
     ds = load_dataset(args.dataset_id, split=f"{args.dataset_split}[:{args.num_samples}]")
@@ -170,6 +193,7 @@ def main():
     # ★ vLLM 제출용 INT4 패키징 구간 (Phase 2)
     # =====================================================================
     print("[INFO] 제출용 INT4 포장(Packing) 작업 시작...")
+    print(f"[INFO] 저장 경로: {args.out_dir}")
     _t3 = time.time()
     os.makedirs(args.out_dir, exist_ok=True)
     gc.collect()
@@ -187,13 +211,22 @@ def main():
         )
     ]
 
-    oneshot(
-        model=model,
-        dataset=ds,
-        recipe=recipe,
-        max_seq_length=args.max_len,
-        num_calibration_samples=args.num_samples,
-    )
+    try:
+        oneshot(
+            model=model,
+            dataset=ds,
+            recipe=recipe,
+            max_seq_length=args.max_len,
+            num_calibration_samples=args.num_samples,
+        )
+    except Exception as e:
+        print(f"[ERROR] oneshot(GPTQ) 실패: {e}")
+        print("[INFO] oneshot 실패 시 OmniQuant 결과만 저장합니다 (model_pre_gptq)...")
+        fallback_dir = os.path.join(os.path.dirname(args.out_dir), "model_pre_gptq")
+        os.makedirs(fallback_dir, exist_ok=True)
+        model.save_pretrained(fallback_dir)
+        tokenizer.save_pretrained(fallback_dir)
+        raise RuntimeError(f"oneshot 실패로 모델이 비어 있습니다. 에러: {e}") from e
     print(f"[INFO] GPTQ 포장 완료 ({time.time()-_t3:.1f}s)")
 
     print("[INFO] 모델 저장 중...")
