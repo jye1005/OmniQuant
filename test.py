@@ -68,7 +68,7 @@ def parse_args():
 
     # 출력
     p.add_argument("--zip_name", default=None, help="None이면 랜덤 이름 자동 생성 (덮어쓰기 방지)")
-    p.add_argument("--zip_dir", default="./zips", help="zip 파일 저장 폴더")
+    p.add_argument("--zip_dir", default=None, help="zip 저장 폴더 (None=out_dir와 같은 위치의 zips/)")
     return p.parse_args()
 
 
@@ -259,7 +259,7 @@ def main():
     # ★ 압축 및 제출 준비 (Phase 3)
     # =====================================================================
     out_dir_abs = os.path.abspath(args.out_dir)
-    zip_dir = os.path.abspath(args.zip_dir)
+    zip_dir = os.path.abspath(args.zip_dir) if args.zip_dir else os.path.join(os.path.dirname(out_dir_abs), "zips")
     os.makedirs(zip_dir, exist_ok=True)
     zip_name = args.zip_name or f"submit_{uuid.uuid4().hex[:12]}"
     zip_path = os.path.join(zip_dir, f"{zip_name}.zip")
