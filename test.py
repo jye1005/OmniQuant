@@ -240,6 +240,22 @@ def main():
     print(f"[INFO] GPTQ 포장 완료 ({time.time()-_t3:.1f}s)")
 
     print("[INFO] 모델 저장 중...")
+    # vLLM 인식 + save_compressed 비트패킹 유도: quantization_config 수동 주입
+    model.config.quantization_config = {
+        "quant_method": "compressed-tensors",
+        "config_groups": {
+            "group_0": {
+                "targets": ["Linear"],
+                "weights": {
+                    "num_bits": 4,
+                    "group_size": config.gptq_block_size,
+                    "symmetric": True,
+                    "type": "int",
+                },
+            }
+        },
+        "ignore": ["lm_head", "embed_tokens"],
+    }
     model.save_pretrained(args.out_dir, save_compressed=True)
     tokenizer.save_pretrained(args.out_dir)
     n_files = len([f for f in os.scandir(args.out_dir) if f.is_file()])
