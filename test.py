@@ -20,6 +20,9 @@ from llmcompressor import oneshot
 
 def parse_args():
     p = argparse.ArgumentParser(description="SpQR + Wanda + OmniQuant 파이프라인")
+    # 메모리 (24GB GPU OOM 시 --low_memory 사용)
+    p.add_argument("--low_memory", action="store_true", help="OOM 방지: num_samples=32, max_len=128, lwc_chunk_size=0(CPU)")
+    p.add_argument("--cuda_alloc_conf", type=str, default=None, help="예: expandable_segments:True (OOM 시 메모리 조각화 완화)")
     # 데이터/모델
     p.add_argument("--model_id", default="LGAI-EXAONE/EXAONE-4.0-1.2B")
     p.add_argument("--out_dir", default="./model")
@@ -43,8 +46,8 @@ def parse_args():
     p.add_argument("--vip_penalty", type=float, default=100.0)
     p.add_argument("--gems_penalty", type=float, default=0.01)
 
-    # LWC 메모리: 0=CPU, 1+=GPU 청크
-    p.add_argument("--lwc_chunk_size", type=int, default=10)
+    # LWC 메모리: 0=전부 CPU, 1+=GPU 청크 (OOM 시 0 권장)
+    p.add_argument("--lwc_chunk_size", type=int, default=0)
 
     # GPTQ
     p.add_argument("--gptq_block_size", type=int, default=128)
@@ -63,6 +66,14 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    if args.cuda_alloc_conf:
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", args.cuda_alloc_conf)
+    if args.low_memory:
+        args.num_samples = 32
+        args.max_len = 128
+        args.lwc_chunk_size = 0
+        print("[INFO] --low_memory: num_samples=32, max_len=128, lwc_chunk_size=0 (CPU)")
 
     config = SpQRWandaConfig(
         tau_h_percentile=args.tau_h,
@@ -140,6 +151,9 @@ def main():
     print("[INFO] SpQR Pruning + Bias Correction 적용...")
     apply_pruning_and_bias_correction(model, masks, x_means, config=config)
     print(f"[INFO] Phase 1 완료 ({time.time()-_t1:.1f}s)")
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     print("[INFO] 커스텀 알고리즘: 3-Tier OmniQuant 학습 시작...")
     _t2 = time.time()
@@ -147,12 +161,18 @@ def main():
         model, calib_dataloader, masks, wanda_scores, config=config
     )
     print(f"[INFO] OmniQuant 학습 완료 ({time.time()-_t2:.1f}s)")
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # =====================================================================
     # ★ vLLM 제출용 INT4 패키징 구간 (Phase 2)
     # =====================================================================
     print("[INFO] 제출용 INT4 포장(Packing) 작업 시작...")
     _t3 = time.time()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     recipe = [
         GPTQModifier(
@@ -185,11 +205,13 @@ def main():
     # =====================================================================
     # ★ 압축 및 제출 준비 (Phase 3)
     # =====================================================================
-    zip_name = args.zip_name
-    print(f"[INFO] {zip_name}.zip 생성 중...")
-    shutil.make_archive(base_name=zip_name, format="zip", root_dir=".", base_dir=args.out_dir)
-    _zip_size_mb = os.path.getsize(f"{zip_name}.zip") / 1024 / 1024
-    print(f"[INFO] 생성 완료: {zip_name}.zip ({_zip_size_mb:.1f} MB)")
+    out_dir_abs = os.path.abspath(args.out_dir)
+    zip_base = os.path.join(os.path.dirname(out_dir_abs), args.zip_name)
+    zip_path = f"{zip_base}.zip"
+    print(f"[INFO] {args.zip_name}.zip 생성 중...")
+    shutil.make_archive(base_name=zip_base, format="zip", root_dir=os.path.dirname(out_dir_abs), base_dir=os.path.basename(out_dir_abs))
+    _zip_size_mb = os.path.getsize(zip_path) / 1024 / 1024
+    print(f"[INFO] 생성 완료: {zip_path} ({_zip_size_mb:.1f} MB)")
 
     _total = time.time() - _t_start
     print(f"\n[INFO] === 전체 파이프라인 완료 ({_total:.1f}s) ===")
