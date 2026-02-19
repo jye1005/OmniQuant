@@ -14,6 +14,12 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
 
+try:
+    import bitsandbytes as bnb
+    BNB_AVAILABLE = True
+except ImportError:
+    BNB_AVAILABLE = False
+
 # ==============================================================================
 # SpQR + Wanda + OmniQuant 통합 하이퍼파라미터
 # ==============================================================================
@@ -50,6 +56,7 @@ class SpQRWandaConfig:
 
     # ----- LWC 메모리 (penalty-only) -----
     lwc_chunk_size: int = 10  # GPU에서 N개씩 처리. 0=전부 CPU, 1=레이어별 GPU, 10=10개씩 GPU
+    use_8bit_optimizer: bool = False  # bitsandbytes AdamW8bit 사용 (GPU 메모리 ~75% 절약)
 
     # ----- wandb -----
     wandb_enable: bool = False
@@ -316,10 +323,14 @@ def run_3tier_omniquant(
     n_batches = len(calib_dataloader)
     print(f"[INFO] OmniQuant: LWC 적용 레이어 {len(lwc_modules)}개, epochs={n_epochs}, batches/epoch={n_batches}")
 
-    optimizer = torch.optim.AdamW(
-        [p for lwc in lwc_modules.values() for p in lwc.parameters()],
-        lr=cfg.omniquant_lr,
-    )
+    params = [p for lwc in lwc_modules.values() for p in lwc.parameters()]
+    if cfg.use_8bit_optimizer and BNB_AVAILABLE:
+        optimizer = bnb.optim.AdamW8bit(params, lr=cfg.omniquant_lr)
+        print("[INFO] 8-bit AdamW 사용 (bitsandbytes) — GPU 메모리 절약")
+    else:
+        optimizer = torch.optim.AdamW(params, lr=cfg.omniquant_lr)
+        if cfg.use_8bit_optimizer and not BNB_AVAILABLE:
+            print("[WARN] use_8bit_optimizer=True지만 bitsandbytes 없음. pip install bitsandbytes 후 사용")
 
     # wandb 초기화 (선택)
     _wandb_run = None

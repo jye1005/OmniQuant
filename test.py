@@ -55,6 +55,7 @@ def parse_args():
 
     # LWC 메모리: 0=전부 CPU, 1+=GPU 청크 (OOM 시 0 권장)
     p.add_argument("--lwc_chunk_size", type=int, default=0)
+    p.add_argument("--use_8bit_optimizer", action="store_true", help="bitsandbytes 8-bit AdamW (GPU 메모리 절약)")
 
     # GPTQ
     p.add_argument("--gptq_block_size", type=int, default=128)
@@ -102,6 +103,7 @@ def main():
         gptq_block_size=args.gptq_block_size,
         gptq_dampening_frac=args.gptq_dampening,
         lwc_chunk_size=args.lwc_chunk_size,
+        use_8bit_optimizer=args.use_8bit_optimizer,
         wandb_enable=args.wandb,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run,
