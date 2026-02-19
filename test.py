@@ -4,6 +4,7 @@ import json
 import time
 import uuid
 import argparse
+import zipfile
 import torch
 import shutil
 from torch.utils.data import DataLoader
@@ -67,6 +68,7 @@ def parse_args():
 
     # 출력
     p.add_argument("--zip_name", default=None, help="None이면 랜덤 이름 자동 생성 (덮어쓰기 방지)")
+    p.add_argument("--zip_dir", default="./zips", help="zip 파일 저장 폴더")
     return p.parse_args()
 
 
@@ -257,13 +259,25 @@ def main():
     # ★ 압축 및 제출 준비 (Phase 3)
     # =====================================================================
     out_dir_abs = os.path.abspath(args.out_dir)
+    zip_dir = os.path.abspath(args.zip_dir)
+    os.makedirs(zip_dir, exist_ok=True)
     zip_name = args.zip_name or f"submit_{uuid.uuid4().hex[:12]}"
-    zip_base = os.path.join(os.path.dirname(out_dir_abs), zip_name)
-    zip_path = f"{zip_base}.zip"
+    zip_path = os.path.join(zip_dir, f"{zip_name}.zip")
     print(f"[INFO] {zip_name}.zip 생성 중... (경로: {zip_path})")
-    shutil.make_archive(base_name=zip_base, format="zip", root_dir=os.path.dirname(out_dir_abs), base_dir=os.path.basename(out_dir_abs))
-    _zip_size_mb = os.path.getsize(zip_path) / 1024 / 1024
-    print(f"[INFO] 생성 완료: {zip_path} ({_zip_size_mb:.1f} MB)")
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for root, _, files in os.walk(out_dir_abs):
+                for f in files:
+                    full_path = os.path.join(root, f)
+                    arcname = os.path.join(os.path.basename(out_dir_abs), os.path.relpath(full_path, out_dir_abs))
+                    zf.write(full_path, arcname=arcname)
+        _zip_size_mb = os.path.getsize(zip_path) / 1024 / 1024
+        print(f"[INFO] 생성 완료: {zip_path} ({_zip_size_mb:.1f} MB)")
+    except Exception as e:
+        print(f"[ERROR] zip 생성 실패: {e}")
+        raise
+    if not os.path.isfile(zip_path) or os.path.getsize(zip_path) == 0:
+        raise RuntimeError(f"zip 파일이 생성되지 않았습니다: {zip_path}")
 
     _total = time.time() - _t_start
     print(f"\n[INFO] === 전체 파이프라인 완료 ({_total:.1f}s) ===")
