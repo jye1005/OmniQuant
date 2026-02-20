@@ -1,6 +1,7 @@
 import os
 import gc
 import json
+import subprocess
 import time
 import uuid
 import argparse
@@ -70,6 +71,8 @@ def parse_args():
     # 출력
     p.add_argument("--zip_name", default=None, help="None이면 랜덤 이름 자동 생성 (덮어쓰기 방지)")
     p.add_argument("--zip_dir", default=None, help="zip 저장 폴더 (None=out_dir와 같은 위치의 zips/)")
+    p.add_argument("--zip_compress", action="store_true", help="zip 압축 사용 (미지정 시 저장만)")
+    p.add_argument("--zip_system", action="store_true", help="시스템 zip 명령 사용 (Mac/Windows 압축해제 호환↑)")
     return p.parse_args()
 
 
@@ -239,23 +242,30 @@ def main():
         raise RuntimeError(f"oneshot 실패로 모델이 비어 있습니다. 에러: {e}") from e
     print(f"[INFO] GPTQ 포장 완료 ({time.time()-_t3:.1f}s)")
 
-    print("[INFO] 모델 저장 중...")
+    print("[INFO] 모델 저장 준비 (bfloat16 복구 및 설정 주입)...")
+    # oneshot 시 dtype 충돌로 float32 썼다면, 저장 직전 bfloat16 복구 → save_compressed가 4비트 패킹 수행
+    model = model.to(torch.bfloat16)
+
     # vLLM 인식 + save_compressed 비트패킹 유도: quantization_config 수동 주입
     model.config.quantization_config = {
         "quant_method": "compressed-tensors",
+        "format": "int-quantized",
         "config_groups": {
             "group_0": {
                 "targets": ["Linear"],
                 "weights": {
                     "num_bits": 4,
-                    "group_size": config.gptq_block_size,
-                    "symmetric": True,
                     "type": "int",
+                    "symmetric": True,
+                    "strategy": "group",
+                    "group_size": config.gptq_block_size,
                 },
             }
         },
         "ignore": ["lm_head", "embed_tokens"],
     }
+
+    print("[INFO] 모델 저장 중...")
     model.save_pretrained(args.out_dir, save_compressed=True)
     tokenizer.save_pretrained(args.out_dir)
     n_files = len([f for f in os.scandir(args.out_dir) if f.is_file()])
@@ -287,13 +297,32 @@ def main():
     zip_name = args.zip_name or f"submit_{uuid.uuid4().hex[:12]}"
     zip_path = os.path.join(zip_dir, f"{zip_name}.zip")
     print(f"[INFO] {zip_name}.zip 생성 중... (경로: {zip_path})")
+    zip_compress = getattr(args, "zip_compress", False)
+    zip_system = getattr(args, "zip_system", False)
     try:
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for root, _, files in os.walk(out_dir_abs):
-                for f in files:
-                    full_path = os.path.join(root, f)
-                    arcname = os.path.join(os.path.basename(out_dir_abs), os.path.relpath(full_path, out_dir_abs))
-                    zf.write(full_path, arcname=arcname)
+        if zip_system and shutil.which("zip"):
+            # 시스템 zip: Mac/Windows 아카이버 호환성 ↑
+            parent_dir = os.path.dirname(out_dir_abs)
+            model_dir_name = os.path.basename(out_dir_abs)
+            cwd = os.getcwd()
+            os.chdir(parent_dir)
+            try:
+                cmd = ["zip", "-r", "-0" if not zip_compress else "-9", zip_path, model_dir_name]
+                subprocess.run(cmd, check=True)
+            finally:
+                os.chdir(cwd)
+            print(f"[INFO] zip 모드: 시스템 zip ({'압축' if zip_compress else '저장만'})")
+        else:
+            if zip_system and not shutil.which("zip"):
+                print("[WARN] 시스템 zip 미설치, Python zipfile 사용")
+            compression = zipfile.ZIP_DEFLATED if zip_compress else zipfile.ZIP_STORED
+            with zipfile.ZipFile(zip_path, "w", compression, allowZip64=True) as zf:
+                for root, _, files in os.walk(out_dir_abs):
+                    for f in files:
+                        full_path = os.path.join(root, f)
+                        arcname = os.path.join(os.path.basename(out_dir_abs), os.path.relpath(full_path, out_dir_abs))
+                        zf.write(full_path, arcname=arcname)
+            print(f"[INFO] zip 모드: Python zipfile ({'압축' if zip_compress else '저장만'})")
         _zip_size_mb = os.path.getsize(zip_path) / 1024 / 1024
         print(f"[INFO] 생성 완료: {zip_path} ({_zip_size_mb:.1f} MB)")
     except Exception as e:
