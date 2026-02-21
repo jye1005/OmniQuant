@@ -242,9 +242,9 @@ def main():
         raise RuntimeError(f"oneshot 실패로 모델이 비어 있습니다. 에러: {e}") from e
     print(f"[INFO] GPTQ 포장 완료 ({time.time()-_t3:.1f}s)")
 
-    print("[INFO] 모델 저장 준비 (bfloat16 복구 및 설정 주입)...")
-    # oneshot 시 dtype 충돌로 float32 썼다면, 저장 직전 bfloat16 복구 → save_compressed가 4비트 패킹 수행
-    model = model.to(torch.bfloat16)
+    print("[INFO] 모델 저장 준비 (quantization_config 주입)...")
+    # 주의: model.to(bfloat16) 금지! oneshot이 만든 QuantLinear의 int8 패킹 가중치가 손상됨 → vLLM INT4 커널 미동작
+    # oneshot 출력을 그대로 저장해야 4비트 패킹이 유지됨
 
     # vLLM 인식 + save_compressed 비트패킹 유도: quantization_config 수동 주입
     model.config.quantization_config = {
