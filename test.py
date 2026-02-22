@@ -53,6 +53,9 @@ def parse_args():
     p.add_argument("--lambda_w", type=float, default=0.01)
     p.add_argument("--vip_penalty", type=float, default=100.0)
     p.add_argument("--gems_penalty", type=float, default=0.01)
+    p.add_argument("--gems_wanda_scale", type=str, default="sqrt", choices=["none", "sqrt", "log"], help="Gems Wanda 스케일: none|sqrt|log (튀는 값 완화)")
+    p.add_argument("--use_symmetric_lwc", action="store_true", default=True, help="대칭 LWC (gamma 1개, zero_point=0)")
+    p.add_argument("--no_symmetric_lwc", action="store_false", dest="use_symmetric_lwc", help="비대칭 LWC 사용")
 
     # LWC 메모리: 0=전부 CPU, 1+=GPU 청크 (OOM 시 0 권장)
     p.add_argument("--lwc_chunk_size", type=int, default=0)
@@ -101,6 +104,8 @@ def main():
         omniquant_lr=args.lr,
         vip_penalty_weight=args.vip_penalty,
         gems_penalty_weight=args.gems_penalty,
+        gems_wanda_scale=args.gems_wanda_scale,
+        use_symmetric_lwc=args.use_symmetric_lwc,
         use_reconstruction_loss=args.use_reconstruction_loss,
         lambda_w=args.lambda_w,
         gptq_block_size=args.gptq_block_size,
