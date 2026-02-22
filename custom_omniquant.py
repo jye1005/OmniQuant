@@ -39,7 +39,7 @@ class SpQRWandaConfig:
     spqr_blocksize: int = 16  # SpQR 기본 16x16 블록 (group_size와 연동)
     spqr_outlier_percentile: Optional[float] = None  # None이면 tau_w 사용. 0.99 = 상위 1%를 outlier
     n_bits_gems: int = 4  # Regular Gems 비트 (2~4)
-    n_bits_vip: int = 16  # VIP 비트 (8 or 16, 16=FP16 보존)
+    n_bits_vip: int = 16  # VIP LWC 패널티용(오차 최소화). 최종 저장은 vLLM 호환을 위해 항상 균일 W4A16
     bias_correction: bool = False  # SpQR Bias Correction 적용 여부 (구현 시 True)
 
     # ----- OmniQuant LWC 학습 -----
@@ -505,33 +505,28 @@ def run_3tier_omniquant(
 # ==============================================================================
 # 3단계: vLLM 호환용 GPTQ 포맷 패키징 (Packing)
 # ==============================================================================
-def pack_to_gptq_and_save(model, tokenizer, out_dir):
+def pack_to_gptq_and_save(model, tokenizer, out_dir, group_size: int = 128):
     """
-    최적화가 끝난 Fake-Quantized 모델을 허깅페이스 표준 `compressed-tensors` 
-    또는 GPTQ 포맷으로 압축하여 저장합니다.
+    최적화가 끝난 Fake-Quantized 모델을 compressed-tensors 균일 W4A16으로 저장합니다.
+    ※ oneshot(GPTQ/RTN) 실행 후 호출해야 함. 이 함수는 config 주입 + save만 수행합니다.
     """
-    # 데이콘 환경에 맞추어 llmcompressor의 내장 save_pretrained를 활용하거나,
-    # config.json에 4비트 양자화 정보를 강제로 주입합니다.
     model.config.quantization_config = {
-        "quant_method": "compressed-tensors", # vLLM이 인식하는 키워드
+        "quant_method": "compressed-tensors",
+        "format": "int-quantized",
         "config_groups": {
             "group_0": {
                 "targets": ["Linear"],
                 "weights": {
                     "num_bits": 4,
-                    "group_size": 128,
+                    "group_size": group_size,
                     "symmetric": True,
-                    "type": "int"
-                }
+                    "type": "int",
+                },
             }
         },
-        "ignore": ["lm_head"]
+        "ignore": ["lm_head", "embed_tokens"],
     }
-    
     os.makedirs(out_dir, exist_ok=True)
-    # 현재 모델은 실수형(FP16)이므로, 내부적으로 정수형 압축이 필요한 경우
-    # llmcompressor의 save_compressed=True 옵션을 활용하여 저장
-    model.save_pretrained(out_dir)
+    model.save_pretrained(out_dir, save_compressed=True)
     tokenizer.save_pretrained(out_dir)
-    
-    print(f"모델이 vLLM 호환 포맷으로 {out_dir} 에 저장되었습니다.")
+    print(f"[INFO] vLLM 호환 compressed-tensors 포맷으로 {out_dir} 저장 완료")

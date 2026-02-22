@@ -19,6 +19,14 @@ from custom_omniquant import (
     run_3tier_omniquant,
 )
 from llmcompressor.modifiers.quantization import GPTQModifier
+
+try:
+    from llmcompressor.modifiers.quantization import QuantizationModifier
+    QUANTIZATION_MODIFIER_AVAILABLE = True
+except ImportError:
+    QuantizationModifier = None
+    QUANTIZATION_MODIFIER_AVAILABLE = False
+
 from llmcompressor import oneshot
 
 
@@ -61,9 +69,16 @@ def parse_args():
     p.add_argument("--lwc_chunk_size", type=int, default=0)
     p.add_argument("--use_8bit_optimizer", action="store_true", help="bitsandbytes 8-bit AdamW (GPU 메모리 절약)")
 
-    # GPTQ
+    # GPTQ / 패킹 (vLLM 호환: 균일 W4A16 필수, mixed precision 미지원)
     p.add_argument("--gptq_block_size", type=int, default=128)
     p.add_argument("--gptq_dampening", type=float, default=0.01)
+    p.add_argument(
+        "--pack_mode",
+        type=str,
+        default="gptq",
+        choices=["gptq", "rtn"],
+        help="gptq: 캘리브 기반 (정확도↑, 시간 소요). rtn: Round-To-Nearest만 (빠름, OmniQuant 결과 보존)",
+    )
 
     # wandb
     p.add_argument("--wandb", action="store_true")
@@ -203,49 +218,99 @@ def main():
         torch.cuda.empty_cache()
 
     # =====================================================================
-    # ★ vLLM 제출용 INT4 패키징 구간 (Phase 2)
+    # ★ vLLM 제출용 균일 W4A16 패키징 (Phase 2)
+    # vLLM은 mixed precision(Trash 0/Gems 4/VIP 16) 미지원 → 반드시 균일 INT4로 저장
+    # 3-Tier는 OmniQuant 학습 시에만 사용, 최종 출력은 항상 compressed-tensors W4A16
     # =====================================================================
-    print("[INFO] 제출용 INT4 포장(Packing) 작업 시작...")
-    print(f"[INFO] 저장 경로: {args.out_dir}")
+    print("[INFO] 제출용 균일 W4A16 패킹 시작 (compressed-tensors 포맷)...")
+    print(f"[INFO] pack_mode={args.pack_mode}, 저장 경로: {args.out_dir}")
     _t3 = time.time()
     os.makedirs(args.out_dir, exist_ok=True)
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    recipe = [
-        GPTQModifier(
-            targets=["Linear"],
-            ignore=["embed_tokens", "lm_head"],
-            scheme="W4A16",
-            block_size=config.gptq_block_size,
-            dampening_frac=config.gptq_dampening_frac,
-            actorder="static",  # group|weight|dynamic|static (False → static으로 고정)
-        )
-    ]
-
-    # llmcompressor GPTQ는 bfloat16과 dtype 충돌 (BFloat16 vs Float) → float32로 변환
+    # llmcompressor oneshot은 bfloat16과 dtype 충돌 → float32 변환
     if next(model.parameters()).dtype == torch.bfloat16:
         print("[INFO] oneshot 호환을 위해 model bfloat16 → float32 변환")
         model = model.to(torch.float32)
 
+    pack_mode = getattr(args, "pack_mode", "gptq")
+    if pack_mode == "rtn" and not QUANTIZATION_MODIFIER_AVAILABLE:
+        print("[WARN] QuantizationModifier 없음 — pack_mode=gptq로 전환")
+        pack_mode = "gptq"
+
     try:
-        oneshot(
-            model=model,
-            dataset=ds,
-            recipe=recipe,
-            max_seq_length=args.max_len,
-            num_calibration_samples=args.num_samples,
-        )
+        if pack_mode == "rtn":
+            # RTN: 캘리브레이션 없이 가중치만 Round-To-Nearest 패킹 (빠름, OmniQuant 결과 보존)
+            recipe = [
+                QuantizationModifier(
+                    targets=["Linear"],
+                    ignore=["embed_tokens", "lm_head"],
+                    scheme="W4A16",
+                )
+            ]
+            try:
+                oneshot(model=model, recipe=recipe, pipeline="datafree")
+            except (TypeError, ValueError) as e1:
+                print(f"[WARN] RTN datafree 실패({e1}), 최소 캘리브로 재시도...")
+                ds_rtn = tokenized_ds.select(range(1))
+                oneshot(
+                    model=model,
+                    dataset=ds_rtn,
+                    recipe=recipe,
+                    max_seq_length=args.max_len,
+                    num_calibration_samples=1,
+                )
+        else:
+            # GPTQ: 캘리브레이션 기반 (정확도↑, 시간 소요)
+            recipe = [
+                GPTQModifier(
+                    targets=["Linear"],
+                    ignore=["embed_tokens", "lm_head"],
+                    scheme="W4A16",
+                    block_size=config.gptq_block_size,
+                    dampening_frac=config.gptq_dampening_frac,
+                    actorder="static",
+                )
+            ]
+            oneshot(
+                model=model,
+                dataset=ds,
+                recipe=recipe,
+                max_seq_length=args.max_len,
+                num_calibration_samples=args.num_samples,
+            )
     except Exception as e:
-        print(f"[ERROR] oneshot(GPTQ) 실패: {e}")
-        print("[INFO] oneshot 실패 시 OmniQuant 결과만 저장합니다 (model_pre_gptq)...")
-        fallback_dir = os.path.join(os.path.dirname(args.out_dir), "model_pre_gptq")
-        os.makedirs(fallback_dir, exist_ok=True)
-        model.save_pretrained(fallback_dir)
-        tokenizer.save_pretrained(fallback_dir)
-        raise RuntimeError(f"oneshot 실패로 모델이 비어 있습니다. 에러: {e}") from e
-    print(f"[INFO] GPTQ 포장 완료 ({time.time()-_t3:.1f}s)")
+        if pack_mode == "rtn":
+            print(f"[WARN] RTN 패킹 실패: {e}")
+            print("[INFO] GPTQ로 폴백합니다...")
+            recipe = [
+                GPTQModifier(
+                    targets=["Linear"],
+                    ignore=["embed_tokens", "lm_head"],
+                    scheme="W4A16",
+                    block_size=config.gptq_block_size,
+                    dampening_frac=config.gptq_dampening_frac,
+                    actorder="static",
+                )
+            ]
+            oneshot(
+                model=model,
+                dataset=ds,
+                recipe=recipe,
+                max_seq_length=args.max_len,
+                num_calibration_samples=args.num_samples,
+            )
+        else:
+            print(f"[ERROR] oneshot 실패: {e}")
+            fallback_dir = os.path.join(os.path.dirname(args.out_dir), "model_pre_gptq")
+            os.makedirs(fallback_dir, exist_ok=True)
+            model.save_pretrained(fallback_dir)
+            tokenizer.save_pretrained(fallback_dir)
+            raise RuntimeError(f"oneshot 실패. 에러: {e}") from e
+
+    print(f"[INFO] 패킹 완료 ({time.time()-_t3:.1f}s)")
 
     print("[INFO] 모델 저장 준비 (quantization_config 주입)...")
     # 주의: model.to(bfloat16) 금지! oneshot이 만든 QuantLinear의 int8 패킹 가중치가 손상됨 → vLLM INT4 커널 미동작
