@@ -47,6 +47,8 @@ class SpQRWandaConfig:
     omniquant_lr: float = 1e-2
     vip_penalty_weight: float = 100.0  # VIP 클리핑 패널티 배수 (패널티만 쓸 때)
     gems_penalty_weight: float = 0.01  # Gems 클리핑 패널티 배수
+    gems_wanda_scale: str = "sqrt"  # none|sqrt|log — Gems Wanda 가중치 스케일
+    use_symmetric_lwc: bool = True  # True: gamma 1개, zero_point=0 대칭형
     use_reconstruction_loss: bool = True  # MSE(original_out, quant_out) 사용
     lambda_w: float = 0.01  # total_loss = mse_loss + lambda_w * wanda_penalty
 
